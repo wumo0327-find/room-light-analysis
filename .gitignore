@@ -1,0 +1,48 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE settings
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# Build and temporary files
+build/
+dist/
+tmp/
+*.log
+
+# Secrets and local environment settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated analysis output
+experiment_out*/
+validate_out*/
+实验结果_*/
+
+# Local building models and project data
+*.rlproj
+
+# Example input data and generated reports (keep example source scripts/docs)
+**/examples/**/*.dxf
+**/examples/**/*.dwg
+**/examples/**/*.scr
+**/examples/**/*.csv
+**/examples/**/*.xlsx
+**/examples/**/*.xls
+**/examples/**/*.png
+**/examples/**/*.jpg
+**/examples/**/*.jpeg
+**/examples/**/*.pdf
