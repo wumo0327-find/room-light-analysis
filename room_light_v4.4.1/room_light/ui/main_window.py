@@ -1,0 +1,1722 @@
+﻿"""
+ui/main_window.py — 主窗口  v4.4.1
+多视图: 建筑视图 / 采光分析 / 热环境 / 参数化实验
+全局分析: 进度条 + 暂停 + 取消
+勾选式导出: PNG(各图+综合拼图) + Excel
+v2.13.0: 左侧侧边栏改为 QStackedWidget（房间参数 / 参数化实验参数），点"参数化
+         实验"视图时自动切换到实验侧边栏。
+v2.14.0: 参数化实验改为跨材料/几何的全局三目标帕累托，新增透视3D三面投影、
+         帕累托显示开关、均衡推荐和四图批量导出。
+"""
+from __future__ import annotations
+import os
+import csv
+import re
+from datetime import datetime
+from copy import deepcopy
+import numpy as np
+import pandas as pd
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
+    QLabel, QStackedWidget, QPushButton, QFileDialog, QMessageBox,
+)
+from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+
+from core.models import (
+    RoomModel, DEFAULT_SUPPORT_COST_PER_M,
+    DEFAULT_INSTALL_COST_PER_WINDOW,
+)
+from core.complex_models import SpaceModel
+from core.space_geometry import space_floor_area_mm2
+from core.legacy_adapter import building_from_room
+from core.daylight import DaylightResult
+from core.thermal  import ThermalResult
+from io_utils.weather_data import WeatherDataset
+from ui.analysis_panel    import AnalysisPanel
+from ui.thermal_panel     import ThermalPanel
+from ui.experiment_panel  import ExperimentPanel
+from ui.experiment_sidebar import ExperimentSidebar
+from ui.progress_dialog   import ProgressDialog, AnalysisWorker
+from ui.complex_space_editor import (
+    ComplexSpaceSummary,
+)
+from ui.unified_building_canvas import UnifiedBuildingCanvas
+from ui.bp_editor_dialog import EmbeddedBpEditorDialog
+from io_utils.project_io import (
+    FILE_EXT, FILE_FILTER, load_building_project, save_building_project,
+)
+from io_utils.model_audit import audit_building_geometry
+from io_utils.bp_bridge import (
+    BP_DRAFT_METADATA_KEY,
+    building_from_document,
+    document_from_building,
+)
+from bp_editor.model import DraftDocument
+
+BPLAN_SUFFIXES = (".bplan.json",)
+BPLAN_OPEN_FILTER = (
+    "RoomLight/BP工程 (*.rlproj *.bplan.json);;"
+    "BP建筑平面 (*.bplan.json);;RoomLight工程 (*.rlproj)"
+)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("建筑室内采光分析工具  v4.4.1  |  被动构件可行域与最小干预版")
+        self.resize(1200, 760)   # v2.12.0: 默认非全屏窗口调小（原1480×900）
+        self.setMinimumSize(1080, 700)
+        self.setAcceptDrops(True)
+
+        self.building = building_from_room(RoomModel())
+        self._bp_document = document_from_building(self.building)[0]
+        self._bp_source_file: str = ""
+        self._active_space_id: str | None = "legacy_space"
+        self._selected_space_ids: list[str] = ["legacy_space"]
+        from io_utils.weather_data import default_dataset
+        self.weather = default_dataset()
+        self._daylight_result: DaylightResult | None = None
+        self._thermal_result:  ThermalResult  | None = None
+        self._daylight_results: dict[str, object] = {}
+        self._thermal_results: dict[str, object] = {}
+        self._current_file: str = ""
+        self._worker: AnalysisWorker | None = None
+        self._experiment_df = None
+        self._optimal_space: SpaceModel | None = None
+        self._optimal_daylight_result: DaylightResult | None = None
+        self._optimal_thermal_result: ThermalResult | None = None
+        self._optimal_spaces: dict[str, SpaceModel] = {}
+        self._optimal_daylight_results: dict[str, object] = {}
+        self._optimal_thermal_results: dict[str, object] = {}
+        self._optimal_label: str = ""
+
+        # ── 布局 ───────────────────────────────────────────────────────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0,0,0,0)
+
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setHandleWidth(2)
+        self._splitter.setStyleSheet("QSplitter::handle{background:#d0d5e0;}")
+
+        # v3.2: 建筑视图按楼层显示全部房间，直接在画布上多选计算范围。
+        self.experiment_sidebar = ExperimentSidebar()
+        self.complex_sidebar = ComplexSpaceSummary()
+        self._sidebar_stack = QStackedWidget()
+        self._sidebar_stack.addWidget(self.complex_sidebar)     # 0 建筑参数
+        self._sidebar_stack.addWidget(self.experiment_sidebar)  # 1 实验参数
+        self._splitter.addWidget(self._sidebar_stack)
+        self.complex_sidebar.edit_requested.connect(
+            self._open_complex_space_editor)
+        self.complex_sidebar.analysis_settings_requested.connect(
+            self._open_space_analysis_settings)
+        self.complex_sidebar.view_changed.connect(
+            self._on_complex_view_changed)
+        self.complex_sidebar.weather_dialog_requested.connect(
+            self._open_weather_dialog)
+        self.experiment_sidebar.run_requested.connect(self._run_experiment)
+        self.experiment_sidebar.export_png_requested.connect(
+            lambda: self.experiment_panel.export_png())
+        self.experiment_sidebar.export_csv_requested.connect(
+            lambda: self.experiment_panel.export_csv())
+
+        right = QWidget(); right.setStyleSheet("background:#ffffff;")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0,0,0,0); right_lay.setSpacing(0)
+        right_lay.addWidget(self._build_toolbar())
+
+        self._stack = QStackedWidget()
+        self.complex_canvas   = UnifiedBuildingCanvas()
+        self.complex_canvas.selection_changed.connect(
+            self._on_canvas_selection_changed)
+        self.complex_canvas.shading_windows_changed.connect(
+            self._on_shading_windows_changed)
+        self.complex_sidebar.shading_selection_mode_changed.connect(
+            self.complex_canvas.set_shading_selection_mode)
+        self.canvas           = self.complex_canvas
+        self.analysis_panel   = AnalysisPanel()
+        self.thermal_panel    = ThermalPanel()
+        self.experiment_panel = ExperimentPanel()
+        self.experiment_panel.view_optimal_requested.connect(
+            self._show_optimal_result)
+        self._stack.addWidget(self.complex_canvas)    # 0
+        self._stack.addWidget(self.analysis_panel)    # 1
+        self._stack.addWidget(self.thermal_panel)     # 2
+        self._stack.addWidget(self.experiment_panel)  # 3
+        right_lay.addWidget(self._stack, 1)
+        self.complex_canvas.set_model(
+            self.building, self._active_space_id, self._selected_space_ids,
+            self._effective_shading_window_keys(), self._bp_document)
+        self.complex_sidebar.set_model(
+            self.building, self._active_space_id, self._selected_space_ids,
+            self._stored_shading_window_count())
+        self.complex_sidebar.set_weather(self.weather)
+        self._refresh_experiment_context()
+
+        self._splitter.addWidget(right)
+        self._splitter.setStretchFactor(0,0)
+        self._splitter.setStretchFactor(1,1)
+        self._splitter.setSizes([320, 1160])
+        root.addWidget(self._splitter)
+
+        # ── 状态栏 ─────────────────────────────────────────────────────────
+        self._status_lbl = QLabel(
+            "就绪 — 可将 .rlproj 或 .bplan.json 文件拖入窗口打开"
+        )
+        self._status_lbl.setStyleSheet("color:#5a6175;padding:0 8px;")
+        from io_utils.weather_data import DEFAULT_LOCATION
+        self._wx_lbl = QLabel(f"气象: {DEFAULT_LOCATION} (TMY默认)")
+        self._wx_lbl.setStyleSheet("color:#16a34a;padding:0 8px;font-weight:600;")
+        self.statusBar().setStyleSheet("background:#f5f6f8;border-top:1px solid #d0d5e0;")
+        self.statusBar().addWidget(self._status_lbl)
+        self.statusBar().addPermanentWidget(self._wx_lbl)
+
+    # ── 工具栏 ────────────────────────────────────────────────────────────
+    def _build_toolbar(self) -> QWidget:
+        bar = QWidget(); bar.setFixedHeight(46)
+        bar.setStyleSheet("background:#f5f6f8;border-bottom:1px solid #d0d5e0;")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12,6,12,6); lay.setSpacing(6)
+
+        # 视图按钮
+        self._btn_arch = QPushButton("建筑视图")
+        self._btn_anal = QPushButton("采光分析")
+        self._btn_thml = QPushButton("热环境")
+        self._btn_exp  = QPushButton("参数化实验")
+        for b in (self._btn_arch, self._btn_anal, self._btn_thml, self._btn_exp):
+            b.setObjectName("view_btn"); b.setFixedHeight(32)
+        self._btn_arch.setProperty("active","true")
+        self._btn_arch.clicked.connect(lambda: self._switch_view(0))
+        self._btn_anal.clicked.connect(lambda: self._switch_view(1))
+        self._btn_thml.clicked.connect(lambda: self._switch_view(2))
+        self._btn_exp.clicked.connect(lambda: self._switch_view(3))
+        lay.addWidget(self._btn_arch)
+        lay.addWidget(self._btn_anal)
+        lay.addWidget(self._btn_thml)
+        lay.addWidget(self._btn_exp)
+
+        lay.addWidget(self._make_sep())
+
+        # 全部分析
+        self._btn_run = QPushButton("▶  分析选中房间")
+        self._btn_run.setObjectName("primary_btn")
+        self._btn_run.setFixedHeight(32)
+        self._btn_run.clicked.connect(self._run_all)
+        lay.addWidget(self._btn_run)
+
+        lay.addWidget(self._make_sep())
+
+        # 项目文件
+        self._btn_open   = QPushButton("📂 打开")
+        self._btn_save   = QPushButton("💾 保存")
+        self._btn_saveas = QPushButton("另存为")
+        for b in (self._btn_open, self._btn_save, self._btn_saveas):
+            b.setFixedHeight(32)
+        self._btn_open.setToolTip(
+            "打开 .rlproj 工程或直接载入 .bplan.json 建筑草图（也可拖拽）"
+        )
+        self._btn_save.setToolTip("保存（已有路径直接覆盖）")
+        self._btn_open.clicked.connect(self._open_project)
+        self._btn_save.clicked.connect(self._save_project)
+        self._btn_saveas.clicked.connect(self._save_project_as)
+        lay.addWidget(self._btn_open)
+        lay.addWidget(self._btn_save)
+        lay.addWidget(self._btn_saveas)
+
+        lay.addStretch()
+
+        # 验证结果查看器（v2.8.0 新增）
+        self._btn_validation = QPushButton("🔍 验证结果")
+        self._btn_validation.setFixedHeight(32)
+        self._btn_validation.setToolTip("查看实测数据交叉验证的图片与数据表（教室平面图/测点、误差对比图等）")
+        self._btn_validation.clicked.connect(self._open_validation_viewer)
+        lay.addWidget(self._btn_validation)
+
+        # 导出
+        self._btn_export = QPushButton("↓ 导出结果")
+        self._btn_export.setFixedHeight(32)
+        self._btn_export.setEnabled(False)
+        self._btn_export.clicked.connect(self._open_export_dialog)
+        lay.addWidget(self._btn_export)
+        return bar
+
+    def _make_sep(self) -> QWidget:
+        s = QWidget(); s.setFixedWidth(1)
+        s.setStyleSheet("background:#d0d5e0;"); return s
+
+    def _view_buttons(self): return (self._btn_arch, self._btn_anal, self._btn_thml, self._btn_exp)
+
+    def _switch_view(self, idx: int):
+        if idx in (1, 2):
+            self._sync_active_results()
+        self._stack.setCurrentIndex(idx)
+        # 参数化实验视图显示实验侧栏，其余视图显示建筑侧栏。
+        self._sidebar_stack.setCurrentIndex(1 if idx == 3 else 0)
+        for i, b in enumerate(self._view_buttons()):
+            b.setProperty("active","true" if i==idx else "false")
+            b.style().unpolish(b); b.style().polish(b)
+
+    # ── 拖拽 ──────────────────────────────────────────────────────────────
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            if any(
+                u.toLocalFile().lower().endswith((FILE_EXT,) + BPLAN_SUFFIXES)
+                for u in e.mimeData().urls()
+            ):
+                e.acceptProposedAction(); return
+        e.ignore()
+
+    def dropEvent(self, e: QDropEvent):
+        for url in e.mimeData().urls():
+            p = url.toLocalFile()
+            if p.lower().endswith((FILE_EXT,) + BPLAN_SUFFIXES):
+                self._load_project_or_bplan(p)
+                e.acceptProposedAction(); return
+        e.ignore()
+
+    # ── 项目 IO ───────────────────────────────────────────────────────────
+    def _save_project(self):
+        self._do_save(self._current_file) if self._current_file else self._save_project_as()
+
+    def _save_project_as(self):
+        default = (os.path.splitext(os.path.basename(self._current_file))[0]
+                   if self._current_file else "untitled") + FILE_EXT
+        path, _ = QFileDialog.getSaveFileName(self, "保存项目", default, FILE_FILTER)
+        if path:
+            if not path.endswith(FILE_EXT): path += FILE_EXT
+            self._do_save(path)
+
+    def _do_save(self, path: str):
+        try:
+            # Persist the exact BP single-source draft with the project.  The
+            # BuildingModel remains an in-memory calculation snapshot only.
+            self.building.metadata[BP_DRAFT_METADATA_KEY] = (
+                self._bp_document.to_dict()
+            )
+            self.building.metadata["selected_space_ids"] = list(
+                self._selected_space_ids
+            )
+            save_building_project(
+                path,
+                self.building,
+                self.weather if self.weather.is_valid() else None,
+                self._active_space_id,
+            )
+            self._current_file = path
+            self._update_title()
+            self._status(f"项目已保存: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+
+    def _open_project(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开项目或BP建筑平面", "", BPLAN_OPEN_FILTER
+        )
+        if path:
+            self._load_project_or_bplan(path)
+
+    def _load_project_or_bplan(self, path: str) -> None:
+        if path.lower().endswith(BPLAN_SUFFIXES):
+            self._load_bplan_file(path)
+        else:
+            self._load_project_file(path)
+
+    def _load_bplan_file(self, path: str) -> None:
+        """Use a .bplan.json directly as the building-view source."""
+        try:
+            document = DraftDocument.load(path)
+            building, active_space_id, _summary = building_from_document(
+                document,
+                self.building,
+                project_name=os.path.basename(path).removesuffix(".bplan.json"),
+                previous_active_space_id=self._active_space_id,
+            )
+            building.name = os.path.basename(path).removesuffix(".bplan.json")
+        except Exception as exc:
+            QMessageBox.critical(self, "打开BP建筑平面失败", str(exc))
+            return
+        self._adopt_bp_document(
+            document,
+            building,
+            active_space_id,
+            source_message=f"已直接载入BP建筑平面：{os.path.basename(path)}",
+        )
+        self._bp_source_file = path
+        # A bplan is the geometry source, not an rlproj save target. Saving the
+        # complete climate/analysis project therefore still asks for rlproj.
+        self._current_file = ""
+        self._update_title()
+
+    def _load_project_file(self, path: str):
+        # 统一入口：复杂空间工程直接读取，v2 及更早的矩形工程自动转换为
+        # BuildingModel 后再显示和计算。
+        self._load_complex_project_file(path)
+
+    def _load_complex_project_file(self, path: str):
+        building, weather, active_space_id, error = load_building_project(path)
+        if error:
+            QMessageBox.critical(self, "打开失败", error)
+            return
+        self.building = building
+        self._bp_document = document_from_building(building)[0]
+        self._bp_source_file = ""
+        self._active_space_id = (
+            active_space_id
+            or (building.spaces()[0].id if building.spaces() else None)
+        )
+        stored_selection = building.metadata.get("selected_space_ids", [])
+        self._selected_space_ids = [
+            str(space_id)
+            for space_id in stored_selection
+            if building.get_space(str(space_id)) is not None
+        ]
+        if not self._selected_space_ids and self._active_space_id:
+            self._selected_space_ids = [self._active_space_id]
+        self._btn_run.setText("▶  分析选中房间")
+        if weather:
+            self.weather = weather
+            self._wx_lbl.setText(
+                f"气象: {weather.location or weather.source}  "
+                f"年均 {weather.annual_avg:.0f} lux"
+            )
+        self.complex_canvas.set_model(
+            self.building, self._active_space_id, self._selected_space_ids,
+            self._effective_shading_window_keys(), self._bp_document)
+        self.complex_sidebar.set_model(
+            self.building, self._active_space_id, self._selected_space_ids,
+            self._stored_shading_window_count())
+        self.complex_sidebar.set_weather(self.weather)
+        self._current_file = path
+        self._daylight_result = None
+        self._thermal_result = None
+        self._daylight_results = {}
+        self._thermal_results = {}
+        self._experiment_df = None
+        self._optimal_space = None
+        self._optimal_daylight_result = None
+        self._optimal_thermal_result = None
+        self._optimal_spaces = {}
+        self._optimal_daylight_results = {}
+        self._optimal_thermal_results = {}
+        self._optimal_label = ""
+        self.analysis_panel.clear_result("已打开新工程，旧分析结果已清除。")
+        self.thermal_panel.clear_result()
+        self._btn_export.setEnabled(False)
+        self.experiment_sidebar.set_export_enabled(False)
+        self.experiment_panel.clear_result(
+            "已打开新工程，请重新运行复杂空间参数化实验。")
+        self._switch_view(0)
+        self._update_title()
+        space = (
+            building.get_space(self._active_space_id)
+            if self._active_space_id else None
+        )
+        self._status(
+            f"已打开工程: {os.path.basename(path)}"
+            + (f"  |  当前空间：{space.name}" if space else "")
+        )
+        self._refresh_experiment_context()
+
+    def _open_complex_space_editor(self):
+        dialog = EmbeddedBpEditorDialog(
+            self.building,
+            self._active_space_id,
+            document=self._bp_document,
+            source_path=self._bp_source_file or None,
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        if dialog.result_building is None:
+            return
+        self._adopt_bp_document(
+            dialog.result_document,
+            dialog.result_building,
+            dialog.result_active_space_id,
+            source_message=(
+                "BP草图已保存，建筑视图已直接刷新；计算几何已在内存中同步，"
+                "未创建中间rlproj文件。气象数据保持不变，请重新运行分析。"
+            ),
+        )
+        self._bp_source_file = dialog.result_source_path or ""
+        self._update_title()
+
+    def _adopt_bp_document(
+        self,
+        document: DraftDocument,
+        building,
+        active_space_id: str | None,
+        *,
+        source_message: str,
+    ) -> None:
+        """Commit one BP draft and refresh display/calculation state together."""
+        self.building = building
+        self._bp_document = DraftDocument.from_dict(document.to_dict())
+        self._active_space_id = active_space_id
+        stored_selection = self.building.metadata.get(
+            "selected_space_ids", []
+        )
+        self._selected_space_ids = [
+            str(space_id)
+            for space_id in stored_selection
+            if self.building.get_space(str(space_id)) is not None
+        ]
+        if not self._selected_space_ids and self._active_space_id:
+            self._selected_space_ids = [self._active_space_id]
+        self._btn_run.setText("▶  分析选中房间")
+        self.complex_canvas.set_model(
+            self.building, self._active_space_id, self._selected_space_ids,
+            self._effective_shading_window_keys(), self._bp_document)
+        self.complex_sidebar.set_model(
+            self.building, self._active_space_id, self._selected_space_ids,
+            self._stored_shading_window_count())
+        self._daylight_result = None
+        self._thermal_result = None
+        self._daylight_results = {}
+        self._thermal_results = {}
+        self._experiment_df = None
+        self._optimal_space = None
+        self._optimal_daylight_result = None
+        self._optimal_thermal_result = None
+        self._optimal_spaces = {}
+        self._optimal_daylight_results = {}
+        self._optimal_thermal_results = {}
+        self._optimal_label = ""
+        self.analysis_panel.clear_result("建筑模型已改变，旧分析结果已清除。")
+        self.thermal_panel.clear_result()
+        self._btn_export.setEnabled(False)
+        self.experiment_sidebar.set_export_enabled(False)
+        self.experiment_panel.clear_result(
+            "建筑模型已改变，请重新运行复杂空间参数化实验。")
+        self._switch_view(0)
+        self._refresh_experiment_context()
+        self._status(source_message)
+
+    def _open_space_analysis_settings(self):
+        spaces = self._selected_spaces()
+        if not spaces:
+            QMessageBox.information(self, "提示", "请先在平面图中选择房间。")
+            return
+        from ui.space_analysis_settings_dialog import (
+            SpaceAnalysisSettingsDialog,
+        )
+        dialog = SpaceAnalysisSettingsDialog(spaces, parent=self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        self._daylight_result = None
+        self._thermal_result = None
+        self._daylight_results = {}
+        self._thermal_results = {}
+        self.analysis_panel.clear_result("房间分析参数已改变，请重新计算。")
+        self.thermal_panel.clear_result()
+        self._btn_export.setEnabled(False)
+        self._invalidate_experiment_results()
+        self.complex_sidebar.set_model(
+            self.building,
+            self._active_space_id,
+            self._selected_space_ids,
+            self._stored_shading_window_count(),
+        )
+        self._refresh_experiment_context()
+        self._status(
+            f"已更新 {len(spaces)} 个选中房间的光学、玻璃、热工和上下边界参数；"
+            "旧分析结果已失效。"
+        )
+
+    def _update_title(self):
+        source = self._current_file or self._bp_source_file
+        fn = os.path.basename(source) if source else ""
+        suf = f"  —  {fn}" if fn else ""
+        self.setWindowTitle(f"建筑室内采光分析工具  v4.4.1{suf}")
+
+    @pyqtSlot(str)
+    def _on_complex_view_changed(self, view: str):
+        self._switch_view(0)
+        self.complex_canvas.set_view(view)
+
+    @pyqtSlot(object, object)
+    def _on_canvas_selection_changed(
+        self,
+        selected_space_ids,
+        active_space_id,
+    ):
+        self._selected_space_ids = [
+            str(space_id)
+            for space_id in selected_space_ids
+            if self.building.get_space(str(space_id)) is not None
+        ]
+        if active_space_id and self.building.get_space(str(active_space_id)):
+            self._active_space_id = str(active_space_id)
+        self.building.metadata["selected_space_ids"] = list(
+            self._selected_space_ids
+        )
+        self.complex_sidebar.set_model(
+            self.building,
+            self._active_space_id,
+            self._selected_space_ids,
+            self._stored_shading_window_count(),
+        )
+        self.complex_canvas.set_shading_window_keys(
+            self._effective_shading_window_keys()
+        )
+        self._sync_active_results()
+        self._invalidate_experiment_results()
+        self._refresh_experiment_context()
+        active = self.building.get_space(self._active_space_id)
+        self._status(
+            f"已选 {len(self._selected_space_ids)} 个房间"
+            + (f"｜当前：{active.name}" if active else "")
+            + "｜再次点击取消，右键房间可单选"
+        )
+
+    def _selected_spaces(self) -> list[SpaceModel]:
+        selected = set(self._selected_space_ids)
+        return [
+            space
+            for space in self.building.spaces()
+            if space.id in selected
+        ]
+
+    def _geometry_ready_for_calculation(self, action_name: str) -> bool:
+        """Block physical calculations when BP and RL geometry disagree."""
+        report = audit_building_geometry(self.building)
+        if report.issues:
+            QMessageBox.critical(
+                self,
+                "模型核验未通过",
+                f"不能开始{action_name}。\n\n{report.summary()}\n\n"
+                "请先进入“编辑空间几何与窗户”修正模型，保存后重新核验。",
+            )
+            return False
+        missing_net = [
+            space.name for space in self._selected_spaces()
+            if not space.analysis_floor_loops
+        ]
+        if missing_net:
+            QMessageBox.critical(
+                self,
+                "计算边界尚未确认",
+                f"不能开始{action_name}。以下房间仍使用旧版墙轴线作为计算边界：\n"
+                + "、".join(missing_net)
+                + "\n\n请用建筑视图中的 BP 编辑器打开原始草图并点击“保存并返回建筑视图”，"
+                "或直接打开对应 .bplan.json。程序会在内存中按墙宽生成实体墙"
+                "内表面净空间后再允许计算。",
+            )
+            return False
+        unconfirmed_boundaries = [
+            space.name for space in self._selected_spaces()
+            if space.metadata.get("boundary_conditions_explicit") is False
+        ]
+        if unconfirmed_boundaries:
+            QMessageBox.warning(
+                self,
+                "热边界尚未确认",
+                f"不能开始{action_name}。以下房间尚未确认上方屋面和下部地面是否"
+                "直接与室外/土壤换热：\n"
+                + "、".join(unconfirmed_boundaries)
+                + "\n\n请在建筑视图点击“设置选中房间的光学与热工参数”，"
+                "按实际楼层勾选后再计算。普通二层且上下均为室内时，两项通常关闭。",
+            )
+            return False
+        return True
+
+    def _stored_shading_window_keys(self):
+        value = self.building.metadata.get("shading_target_window_keys")
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        from core.complex_experiments import (
+            exterior_windows,
+            window_selection_key,
+        )
+        valid = {
+            window_selection_key(space, wall, opening)
+            for space in self.building.spaces()
+            for wall, opening in exterior_windows(space)
+        }
+        return [
+            str(key) for key in value
+            if str(key) in valid
+        ]
+
+    def _effective_shading_window_keys(self) -> list[str]:
+        stored = self._stored_shading_window_keys()
+        if stored is not None:
+            return stored
+        from core.complex_experiments import (
+            exterior_windows,
+            window_selection_key,
+        )
+        return [
+            window_selection_key(space, wall, opening)
+            for space in self._selected_spaces()
+            for wall, opening in exterior_windows(space)
+        ]
+
+    def _stored_shading_window_count(self):
+        stored = self._stored_shading_window_keys()
+        return None if stored is None else len(stored)
+
+    @pyqtSlot(object)
+    def _on_shading_windows_changed(self, keys) -> None:
+        self.building.metadata["shading_target_window_keys"] = [
+            str(value) for value in keys
+        ]
+        self.complex_sidebar.set_model(
+            self.building,
+            self._active_space_id,
+            self._selected_space_ids,
+            len(keys),
+        )
+        self._invalidate_experiment_results()
+        self._refresh_experiment_context()
+        self._status(
+            f"已指定 {len(keys)} 扇参数化遮阳窗；"
+            "橙色窗将安装遮阳板并计入造价。"
+        )
+
+    def _sync_active_results(self) -> None:
+        self._daylight_result = self._daylight_results.get(
+            self._active_space_id
+        )
+        self._thermal_result = self._thermal_results.get(
+            self._active_space_id
+        )
+        space = self.building.get_space(self._active_space_id)
+        if space is None:
+            return
+        optimal_space = self._optimal_spaces.get(self._active_space_id)
+        optimal_daylight = self._optimal_daylight_results.get(
+            self._active_space_id
+        )
+        optimal_thermal = self._optimal_thermal_results.get(
+            self._active_space_id
+        )
+        if self._daylight_result is not None:
+            weather_info = (
+                f"气象: {self.weather.location}  "
+                f"Eout={self.weather.annual_avg:.0f} lux"
+            )
+            if optimal_space is not None and optimal_daylight is not None:
+                self.analysis_panel.set_comparison(
+                    self._daylight_result,
+                    space,
+                    optimal_daylight,
+                    optimal_space,
+                    weather_info=(
+                        f"{weather_info}｜数值：当前 → 最优｜{self._optimal_label}"
+                    ),
+                )
+            else:
+                self.analysis_panel.update(
+                    self._daylight_result,
+                    space,
+                    weather_info=weather_info,
+                )
+        if self._thermal_result is not None:
+            if optimal_space is not None and optimal_thermal is not None:
+                self.thermal_panel.set_comparison(
+                    self._thermal_result,
+                    space,
+                    optimal_thermal,
+                    optimal_space,
+                )
+            else:
+                self.thermal_panel.update(self._thermal_result, space)
+        self._btn_export.setEnabled(
+            bool(self._daylight_results or self._thermal_results)
+            or self._experiment_df is not None
+        )
+
+    @pyqtSlot()
+    def _open_weather_dialog(self):
+        from ui.weather_dialog import WeatherDialog
+        dlg = WeatherDialog(self.weather, parent=self)
+        dlg.accepted_data.connect(self._on_weather_set)
+        dlg.exec()
+
+    def _on_weather_set(self, ds: WeatherDataset):
+        self.weather = ds
+        if ds.latitude is not None:
+            self.building.location.latitude = float(ds.latitude)
+        if ds.longitude is not None:
+            self.building.location.longitude = float(ds.longitude)
+        self._wx_lbl.setText(
+            f"气象: {ds.location or ds.source}  年均 {ds.annual_avg:.0f} lux")
+        self._wx_lbl.setStyleSheet("color:#16a34a;padding:0 8px;font-weight:600;")
+        self.complex_sidebar.set_weather(ds)
+        self._daylight_results = {}
+        self._thermal_results = {}
+        self._daylight_result = None
+        self._thermal_result = None
+        self.analysis_panel.clear_result("气象数据已改变，请重新计算。")
+        self.thermal_panel.clear_result()
+        self._invalidate_experiment_results()
+        self._refresh_experiment_context()
+        self._status(f"气象数据已设置 — 年均 {ds.annual_avg:.0f} lux")
+
+    def _refresh_experiment_context(self):
+        if not hasattr(self, "experiment_sidebar"):
+            return
+        from core.complex_experiments import selected_exterior_windows
+        target_keys = self._effective_shading_window_keys()
+        target_count = sum(
+            len(selected_exterior_windows(space, target_keys))
+            for space in self._selected_spaces()
+        )
+        self.experiment_sidebar.set_complex_project_context(
+            self._selected_spaces(),
+            self.weather if self.weather and self.weather.is_valid() else None,
+            os.path.basename(self._current_file) if self._current_file else "未命名工程",
+            target_window_count=target_count,
+        )
+
+    def _invalidate_experiment_results(self):
+        """当前工程或气候改变后，旧参数实验不再允许查看或导出。"""
+        if (self._experiment_df is None
+                and self._optimal_daylight_result is None
+                and self._optimal_thermal_result is None
+                and not self._optimal_spaces):
+            return
+        self._experiment_df = None
+        self._optimal_space = None
+        self._optimal_daylight_result = None
+        self._optimal_thermal_result = None
+        self._optimal_spaces = {}
+        self._optimal_daylight_results = {}
+        self._optimal_thermal_results = {}
+        self._optimal_label = ""
+        self.experiment_sidebar.set_export_enabled(False)
+        self.experiment_panel.clear_result()
+        self._btn_export.setEnabled(
+            self._daylight_result is not None or self._thermal_result is not None)
+        self._sync_active_results()
+
+    # ── 全部分析 ──────────────────────────────────────────────────────────
+    def _run_all(self):
+        self._run_complex_analysis()
+
+    def _run_complex_analysis(self):
+        if not self._geometry_ready_for_calculation("采光与热环境分析"):
+            return
+        spaces = self._selected_spaces()
+        if not spaces:
+            QMessageBox.warning(
+                self,
+                "无法计算",
+                "请先在建筑平面图中点击选择至少一个房间。",
+            )
+            return
+        outdoor = (
+            self.weather.annual_avg
+            if self.weather.is_valid() else 15_000.0
+        )
+        steps = []
+        for source_space in spaces:
+            space = deepcopy(source_space)
+            space_id = source_space.id
+
+            def _run_daylight(
+                progress_cb,
+                target=space,
+                target_id=space_id,
+            ):
+                from core.complex_daylight import (
+                    GRID_MM,
+                    WIN_DIV,
+                    build_workplane_grid,
+                    compute_complex_daylight,
+                )
+                _xs, ys, _mask = build_workplane_grid(target, GRID_MM)
+                total_rows = len(ys)
+
+                def _row_callback(index):
+                    progress_cb(index + 1, total_rows)
+
+                result = compute_complex_daylight(
+                    target,
+                    E_out=outdoor,
+                    grid_mm=GRID_MM,
+                    ndiv=WIN_DIV,
+                    store_components=True,
+                    row_cb=_row_callback,
+                )
+                return "daylight", target_id, result
+
+            def _run_thermal(
+                progress_cb,
+                target=space,
+                target_id=space_id,
+            ):
+                from core.complex_thermal import compute_complex_thermal
+
+                def _month_callback(index):
+                    progress_cb(index + 1, 12)
+
+                result = compute_complex_thermal(
+                    target,
+                    self.weather.monthly_ghi,
+                    self.weather.monthly_temp,
+                    latitude_deg=self.building.location.latitude,
+                    north_angle_deg=self.building.north_angle_deg,
+                    progress_cb=_month_callback,
+                )
+                return "thermal", target_id, result
+
+            steps.extend([
+                (f"采光｜{source_space.name}", _run_daylight),
+                (f"热环境｜{source_space.name}", _run_thermal),
+            ])
+
+        step_names = [name for name, _runner in steps]
+        dialog = ProgressDialog(step_names, parent=self)
+        self._worker = AnalysisWorker(steps)
+        dialog.bind_worker(self._worker)
+        self._worker.step_done.connect(self._on_step_done)
+        self._worker.all_done.connect(self._on_batch_analysis_done)
+        self._worker.all_done.connect(dialog.accept)
+        dialog.cancelled.connect(self._worker.cancel)
+        self._btn_run.setEnabled(False)
+        self._worker.finished.connect(
+            lambda: self._btn_run.setEnabled(True))
+        self._worker.start()
+        dialog.exec()
+
+    @pyqtSlot(int, str, object)
+    def _on_step_done(self, idx: int, name: str, result):
+        if (
+            isinstance(result, tuple)
+            and len(result) == 3
+            and result[1]
+        ):
+            kind, space_id, payload = result
+            if kind == "daylight":
+                self._daylight_results[str(space_id)] = payload
+            elif kind == "thermal":
+                self._thermal_results[str(space_id)] = payload
+        self._status(f"✓ {name} 完成")
+
+    @pyqtSlot()
+    def _on_batch_analysis_done(self):
+        self._sync_active_results()
+        calculated = len(
+            set(self._daylight_results) | set(self._thermal_results)
+        )
+        if calculated:
+            self._btn_export.setEnabled(True)
+            self._switch_view(1)
+        self._status(
+            f"✓ 已完成 {calculated} 个选中房间的批量采光与热环境分析；"
+            "回到建筑视图点击房间可切换结果。"
+        )
+
+    # ── 参数化实验（后台线程，复用 AnalysisWorker + ProgressDialog）─────────
+    EXP_NDIV = 20   # 批量实验采光离散数（兼顾速度）
+
+    def _run_experiment(self, params: dict):
+        if not self._geometry_ready_for_calculation("参数化遮阳实验"):
+            return
+        geometry_audit = audit_building_geometry(self.building)
+        spaces = self._selected_spaces()
+        if not spaces:
+            QMessageBox.information(
+                self, "提示", "请先在建筑平面图中点击选择房间。")
+            return
+        from core.complex_experiments import selected_exterior_windows
+        target_window_keys = self._effective_shading_window_keys()
+        target_count = sum(
+            len(selected_exterior_windows(space, target_window_keys))
+            for space in spaces
+        )
+        if target_count <= 0:
+            QMessageBox.information(
+                self,
+                "提示",
+                "所选房间中没有参数化遮阳位置。\n"
+                "请回到建筑视图，点击“在图中选择参数化遮阳窗”，"
+                "再点击需要安装遮阳板的外窗。",
+            )
+            return
+        weather = self.weather if self.weather.is_valid() else None
+        from io_utils.weather_data import default_dataset
+        weather = weather or default_dataset()
+        self._exp_params = dict(params)
+        self._exp_params["model_type"] = "multi_complex_spaces"
+        self._exp_params["application_scope"] = (
+            f"选中{len(spaces)}个房间内指定的{target_count}扇外窗"
+        )
+        self._exp_params["target_window_keys"] = list(target_window_keys)
+        self._exp_params["selected_space_ids"] = [
+            space.id for space in spaces
+        ]
+        self._exp_params["selected_space_names"] = [
+            space.name for space in spaces
+        ]
+        tilt_degs  = params["tilt_degs"]
+        depth_mms  = params["depth_mms"]
+        gap_mms    = params["gap_mms"]
+        materials  = params["materials"]
+        space_snaps = [deepcopy(space) for space in spaces]
+        positive_depths = [v for v in depth_mms if float(v) > 0.0]
+        include_zero = any(float(v) <= 0.0 for v in depth_mms)
+        material_count = max(1, len(materials))
+        device_types = params.get("device_types", ["horizontal_overhang"])
+        overhang_count = (
+            len(tilt_degs) * len(positive_depths) * len(gap_mms) * material_count
+            if "horizontal_overhang" in device_types else 0
+        )
+        lp = params.get("louver_params", {})
+        louver_count = (
+            len(lp.get("angles", [])) * len(lp.get("widths", []))
+            * len(lp.get("spacings", [])) * len(lp.get("positions", []))
+            * len(lp.get("controls", [])) * material_count
+            if "louver" in device_types else 0
+        )
+        sp = params.get("light_shelf_params", {})
+        shelf_count = (
+            len(sp.get("inside_depths", [])) * len(sp.get("outside_depths", []))
+            * len(sp.get("tilts", [])) * len(sp.get("upper_ratios", []))
+            * material_count
+            if "light_shelf" in device_types else 0
+        )
+        per_room = 1 + int(include_zero) + overhang_count + louver_count + shelf_count
+        batch_total = per_room * len(space_snaps)
+        # v4 two-stage calculation: coarse scan first, then re-evaluate the
+        # current Pareto set and top compromise candidates with adaptive
+        # window-integration density.  Thermal results do not depend on ndiv,
+        # so only daylight is recalculated at 40/60/80 as needed.
+        max_refine_schemes = 48
+        refine_levels = (40, 60, 80)
+        seed_count = int(params.get("combination_seed_count", 2))
+        possible_pairs = (
+            len(device_types) * (len(device_types) - 1) // 2
+            * seed_count * seed_count
+            if params.get("enable_combinations", True) else 0
+        )
+        total = batch_total + possible_pairs + len(refine_levels) * len(space_snaps) * (
+            max_refine_schemes + 1
+        )
+
+        def _run_exp(progress_cb):
+            from core.experiments import (
+                annotate_global_selection, balanced_compromise,
+            )
+            from core.complex_experiments import (
+                _daylight_metrics, build_solution_space, build_combination_space,
+                run_multi_space_experiments,
+            )
+            from core.decision import annotate_minimum_intervention
+            from core.space_geometry import space_floor_area_mm2
+            from core.complex_daylight import (
+                GRID_MM, WIN_DIV,
+                compute_complex_daylight,
+            )
+            from core.complex_thermal import compute_complex_thermal
+            scan_progress = 0
+            def _pcb(_tag, current, _batch_total):
+                nonlocal scan_progress
+                # L2 uses its own local counter; never let the visible progress
+                # bar jump backwards when the scan changes phase.
+                if str(_tag).startswith("L2"):
+                    scan_progress = max(scan_progress, batch_total + int(current))
+                else:
+                    scan_progress = max(scan_progress, int(current))
+                progress_cb(scan_progress, total)
+
+            df = run_multi_space_experiments(
+                spaces=space_snaps,
+                weather=weather,
+                ndiv=self.EXP_NDIV,
+                tilt_degs=tilt_degs,
+                depth_mms=depth_mms, gap_mms=gap_mms, materials=materials,
+                include_baseline=True,
+                progress_cb=_pcb,
+                material_unit_costs=params.get("material_unit_costs"),
+                support_cost_per_m=params.get(
+                    "support_cost_per_m", DEFAULT_SUPPORT_COST_PER_M),
+                install_cost_per_window=params.get(
+                    "install_cost_per_window",
+                    DEFAULT_INSTALL_COST_PER_WINDOW),
+                latitude_deg=self.building.location.latitude,
+                north_angle_deg=self.building.north_angle_deg,
+                target_window_keys=target_window_keys,
+                grid_mm=GRID_MM,
+                operation_profile=params.get("operation_profile"),
+                device_types=params.get("device_types"),
+                louver_params=params.get("louver_params"),
+                light_shelf_params=params.get("light_shelf_params"),
+                constraints=params.get("constraints"),
+                minimum_criterion=params.get(
+                    "minimum_criterion", "annual_total_cost"),
+                enable_combinations=params.get("enable_combinations", True),
+                combination_seed_count=params.get("combination_seed_count", 2),
+            )
+            df["numerical_stage"] = "参数扫描(ndiv=20)"
+            df["refined_ndiv"] = np.nan
+            df["software_version"] = "4.4.1"
+            df["geometry_fingerprint"] = geometry_audit.fingerprint
+            df["geometry_audit_status"] = geometry_audit.status
+            df["weather_source"] = weather.location or weather.source
+            df["selected_space_count"] = len(space_snaps)
+            df["target_window_count"] = target_count
+            df["workplane_grid_mm"] = GRID_MM
+            df["scan_ndiv"] = self.EXP_NDIV
+            completed = max(batch_total, scan_progress)
+            refined: set = set()
+            performance_columns = (
+                "Ra", "daylight_score", "U0", "DF_avg", "E_avg", "comfort_months",
+                "comfort_ratio", "overheat_months",
+                "overheat_degree_months", "underheat_degree_months",
+                "thermal_discomfort", "SC_annual",
+            )
+            for column in performance_columns:
+                if column in df.columns:
+                    df[f"scan_{column}"] = df[column]
+            df["refinement_delta_Ra"] = np.nan
+            df["refinement_delta_Cd"] = np.nan
+            df["refinement_delta_U0"] = np.nan
+            df["refinement_delta_thermal"] = np.nan
+            df["convergence_delta_Ra"] = np.nan
+            df["convergence_delta_Cd"] = np.nan
+            df["convergence_delta_U0"] = np.nan
+            df["convergence_passed"] = np.nan
+
+            def _solution_from_row(source_space, row):
+                if str(row.get("device_type", "")) != "combination":
+                    return build_solution_space(
+                        source_space, row,
+                        target_window_keys=target_window_keys,
+                    )
+                left_match = df[df["param_label"].astype(str) == str(
+                    row.get("combination_a", "")
+                )]
+                right_match = df[df["param_label"].astype(str) == str(
+                    row.get("combination_b", "")
+                )]
+                if left_match.empty or right_match.empty:
+                    raise ValueError("组合方案缺少L1构件来源，无法重建几何。")
+                return build_combination_space(
+                    source_space, left_match.iloc[0], right_match.iloc[0],
+                    target_window_keys=target_window_keys,
+                )
+
+            # Pareto membership can change after refinement, so repeat until
+            # no new frontier/top-five candidate appears (or the documented
+            # safety cap is reached).
+            for _round in range(4):
+                flagged = annotate_global_selection(
+                    df,
+                    thermal_col=params.get("y", "thermal_discomfort"),
+                    maximize_thermal=params.get("maximize_y", False),
+                    u0_min=params.get("u0_min", 0.0),
+                )
+                top_compromise = (
+                    flagged["recommendation_rank"].fillna(9999) <= 8
+                )
+                any_2d_front = (
+                    flagged["pareto_light_thermal_2d"].fillna(False)
+                    | flagged["pareto_light_cost_2d"].fillna(False)
+                    | flagged["pareto_thermal_cost_2d"].fillna(False)
+                )
+                target_mask = (
+                    top_compromise
+                    | flagged["global_pareto"].fillna(False)
+                    | any_2d_front
+                )
+                # L2已在组合阶段用真实联合几何计算；本轮自适应复核先集中于
+                # 可重建的L0/L1边界点，组合方案在最终独立验证规程中复核。
+                target_mask &= flagged.get("device_type", "").astype(str) != "combination"
+                priority = pd.Series(3, index=flagged.index, dtype=int)
+                priority.loc[any_2d_front] = 2
+                priority.loc[flagged["global_pareto"].fillna(False)] = 1
+                priority.loc[top_compromise] = 0
+                target_indices = (
+                    flagged.loc[target_mask]
+                    .assign(_refine_priority=priority.loc[target_mask])
+                    .sort_values(
+                        ["_refine_priority", "recommendation_rank"],
+                        ascending=[True, True],
+                        kind="mergesort",
+                    )
+                    .index.tolist()
+                )
+                pending = [index for index in target_indices if index not in refined]
+                if not pending:
+                    break
+                pending = pending[:max(0, max_refine_schemes - len(refined))]
+                if not pending:
+                    break
+                for index in pending:
+                    row = df.loc[index]
+                    previous_ra = float(df.at[index, "scan_Ra"])
+                    previous_cd = float(df.at[index, "scan_daylight_score"])
+                    previous_u0 = float(df.at[index, "scan_U0"])
+                    converged = False
+                    final_ndiv = self.EXP_NDIV
+                    for refine_ndiv in refine_levels:
+                        room_metrics = []
+                        for source_space in space_snaps:
+                            solution = _solution_from_row(source_space, row)
+                            daylight = compute_complex_daylight(
+                                solution,
+                                E_out=weather.annual_avg,
+                                ndiv=refine_ndiv,
+                                store_components=False,
+                            )
+                            completed += 1
+                            progress_cb(completed, total)
+                            room_metrics.append({
+                                **_daylight_metrics(daylight),
+                                "floor_area_m2": (
+                                    space_floor_area_mm2(solution)
+                                    / 1_000_000.0
+                                ),
+                            })
+                        areas = np.asarray([
+                            item["floor_area_m2"] for item in room_metrics
+                        ], dtype=float)
+                        if float(areas.sum()) <= 1e-12:
+                            areas = np.ones(len(room_metrics), dtype=float)
+                        for column in ("Ra", "daylight_score", "U0", "DF_avg", "E_avg"):
+                            df.at[index, column] = float(np.average(
+                                [item[column] for item in room_metrics],
+                                weights=areas,
+                            ))
+                        current_ra = float(df.at[index, "Ra"])
+                        current_cd = float(df.at[index, "daylight_score"])
+                        current_u0 = float(df.at[index, "U0"])
+                        convergence_delta_ra = current_ra - previous_ra
+                        convergence_delta_cd = current_cd - previous_cd
+                        convergence_delta_u0 = current_u0 - previous_u0
+                        final_ndiv = refine_ndiv
+                        converged = bool(
+                            abs(convergence_delta_ra) <= 0.005
+                            and abs(convergence_delta_cd) <= 0.003
+                            and abs(convergence_delta_u0) <= 0.01
+                        )
+                        df.at[index, "convergence_delta_Ra"] = convergence_delta_ra
+                        df.at[index, "convergence_delta_Cd"] = convergence_delta_cd
+                        df.at[index, "convergence_delta_U0"] = convergence_delta_u0
+                        if converged:
+                            break
+                        previous_ra = current_ra
+                        previous_cd = current_cd
+                        previous_u0 = current_u0
+                    df.at[index, "numerical_stage"] = (
+                        f"帕累托自适应复核(ndiv={final_ndiv})"
+                    )
+                    df.at[index, "refined_ndiv"] = final_ndiv
+                    df.at[index, "refinement_delta_Ra"] = (
+                        float(df.at[index, "Ra"])
+                        - float(df.at[index, "scan_Ra"])
+                    )
+                    df.at[index, "refinement_delta_Cd"] = (
+                        float(df.at[index, "daylight_score"])
+                        - float(df.at[index, "scan_daylight_score"])
+                    )
+                    df.at[index, "refinement_delta_U0"] = (
+                        float(df.at[index, "U0"])
+                        - float(df.at[index, "scan_U0"])
+                    )
+                    df.at[index, "refinement_delta_thermal"] = (
+                        0.0
+                    )
+                    # Cd changed during the high-density daylight pass, so
+                    # refresh lighting electricity and the annual cost axis.
+                    from core.operation import refresh_record_daylight_cost
+                    refreshed = refresh_record_daylight_cost(
+                        df.loc[index].to_dict(),
+                        params.get("operation_profile"),
+                    )
+                    for cost_column in (
+                        "annual_lighting_kwh", "annual_operating_kwh",
+                        "annual_operating_cost", "annual_total_cost", "cost",
+                    ):
+                        if cost_column in refreshed:
+                            df.at[index, cost_column] = refreshed[cost_column]
+                    df.at[index, "convergence_passed"] = converged
+                    refined.add(index)
+
+            # Freeze the displayed/exported classifications after the full
+            # precision pass.  Every 2D red circle, every global Pareto ring
+            # and the top compromise candidates are explicitly marked as
+            # verified or scan-only in the result table/CSV.
+            df = annotate_global_selection(
+                df,
+                thermal_col=params.get("y", "thermal_discomfort"),
+                maximize_thermal=params.get("maximize_y", False),
+                u0_min=params.get("u0_min", 0.0),
+            )
+            df = annotate_minimum_intervention(
+                df, params.get("constraints"),
+                criterion=params.get("minimum_criterion", "annual_total_cost"),
+            )
+            important = (
+                df["global_pareto"].fillna(False)
+                | df["pareto_light_thermal_2d"].fillna(False)
+                | df["pareto_light_cost_2d"].fillna(False)
+                | df["pareto_thermal_cost_2d"].fillna(False)
+                | (df["recommendation_rank"].fillna(9999) <= 8)
+            )
+            refined_mask = df.index.isin(refined)
+            converged_mask = df["convergence_passed"].fillna(False).astype(bool)
+            df["precision_verified"] = refined_mask & converged_mask
+            df["precision_note"] = "参数扫描"
+            df.loc[important & ~refined_mask, "precision_note"] = (
+                "仅参数扫描，达到复核上限"
+            )
+            df.loc[refined_mask & ~converged_mask, "precision_note"] = (
+                "自适应复核至 ndiv=80，仍需独立验证"
+            )
+            for refined_ndiv in refine_levels:
+                mask = refined_mask & converged_mask & (
+                    df["refined_ndiv"] == refined_ndiv
+                )
+                df.loc[mask, "precision_note"] = (
+                    f"自适应复核 ndiv={refined_ndiv}，已收敛"
+                )
+
+            recommended = df[df["decision_recommended"].fillna(False)].copy()
+            package = {
+                "df": df,
+                "optimal_row": None,
+                "optimal_spaces": {},
+                "optimal_daylight_results": {},
+                "optimal_thermal_results": {},
+            }
+            if recommended.empty:
+                return package
+            row = recommended.iloc[0]
+            optimal_spaces = {}
+            optimal_daylights = {}
+            optimal_thermals = {}
+            for source_space in space_snaps:
+                optimal_space = _solution_from_row(source_space, row)
+                daylight = compute_complex_daylight(
+                    optimal_space,
+                    E_out=weather.annual_avg,
+                    ndiv=max(
+                        WIN_DIV,
+                        int(row.get("refined_ndiv", WIN_DIV))
+                        if np.isfinite(float(row.get("refined_ndiv", WIN_DIV)))
+                        else WIN_DIV,
+                    ),
+                    store_components=True,
+                )
+                completed += 1
+                progress_cb(completed, total)
+                thermal = compute_complex_thermal(
+                    optimal_space,
+                    weather.monthly_ghi,
+                    weather.monthly_temp,
+                    latitude_deg=self.building.location.latitude,
+                    north_angle_deg=self.building.north_angle_deg,
+                )
+                completed += 1
+                progress_cb(completed, total)
+                optimal_spaces[source_space.id] = optimal_space
+                optimal_daylights[source_space.id] = daylight
+                optimal_thermals[source_space.id] = thermal
+            package.update({
+                "optimal_row": row.to_dict(),
+                "optimal_spaces": optimal_spaces,
+                "optimal_daylight_results": optimal_daylights,
+                "optimal_thermal_results": optimal_thermals,
+            })
+            return package
+
+        dlg = ProgressDialog(
+            [f"{len(spaces)}个选中房间参数化实验"],
+            parent=self,
+        )
+        self._exp_worker = AnalysisWorker([
+            (f"{len(spaces)}个选中房间参数化实验", _run_exp)
+        ])
+        dlg.bind_worker(self._exp_worker)
+        self._exp_worker.step_done.connect(self._on_experiment_done)
+        self._exp_worker.all_done.connect(dlg.accept)
+        dlg.cancelled.connect(self._exp_worker.cancel)
+        self._exp_worker.start()
+        dlg.exec()
+
+    @pyqtSlot(int, str, object)
+    def _on_experiment_done(self, idx: int, name: str, result):
+        if result is not None:
+            package = result if isinstance(result, dict) and "df" in result else {"df": result}
+            df = package["df"]
+            self._experiment_df = df
+            self._optimal_spaces = package.get("optimal_spaces", {})
+            self._optimal_daylight_results = package.get(
+                "optimal_daylight_results", {}
+            )
+            self._optimal_thermal_results = package.get(
+                "optimal_thermal_results", {}
+            )
+            self._optimal_space = self._optimal_spaces.get(
+                self._active_space_id
+            )
+            self._optimal_daylight_result = (
+                self._optimal_daylight_results.get(self._active_space_id)
+            )
+            self._optimal_thermal_result = (
+                self._optimal_thermal_results.get(self._active_space_id)
+            )
+            optimal_row = package.get("optimal_row") or {}
+            self._optimal_label = str(optimal_row.get("param_label", ""))
+            self._sync_active_results()
+            self.experiment_panel.show_result(
+                df, getattr(self, "_exp_params", {}),
+                has_optimal=self._optimal_space is not None)
+            self.experiment_sidebar.set_export_enabled(True)
+            self._btn_export.setEnabled(True)
+            self._switch_view(3)
+            if self._optimal_space is not None:
+                detail = "已生成最优方案完整分析"
+            else:
+                detail = "只有改造前基准，没有可推荐的L>0遮阳方案"
+            self._status(f"✓ 参数化实验完成（{len(df)} 个算例，{detail}）")
+
+    @pyqtSlot(str)
+    def _show_optimal_result(self, view: str):
+        self._optimal_space = self._optimal_spaces.get(
+            self._active_space_id,
+            self._optimal_space,
+        )
+        self._optimal_daylight_result = self._optimal_daylight_results.get(
+            self._active_space_id,
+            self._optimal_daylight_result,
+        )
+        self._optimal_thermal_result = self._optimal_thermal_results.get(
+            self._active_space_id,
+            self._optimal_thermal_result,
+        )
+        if not (self._optimal_space and self._optimal_daylight_result
+                and self._optimal_thermal_result):
+            QMessageBox.information(self, "提示", "尚无可查看的最优方案完整分析。")
+            return
+        if view == "daylight":
+            self._switch_view(1)
+        else:
+            self._switch_view(2)
+        self._sync_active_results()
+        self._status(
+            f"正在对比当前方案与最优方案：{self._optimal_label}"
+            "（原工程未被修改）"
+        )
+
+    # ── 验证结果查看器 ────────────────────────────────────────────────────
+    def _open_validation_viewer(self):
+        from ui.validation_viewer_dialog import ValidationViewerDialog
+        # 默认定位到程序自带的 examples/ 目录（若存在），否则留空让用户自己选
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "examples")
+        default_dir = os.path.normpath(default_dir)
+        if not os.path.isdir(default_dir):
+            default_dir = None
+        dlg = ValidationViewerDialog(initial_dir=default_dir, parent=self)
+        dlg.exec()
+
+    # ── 导出 ──────────────────────────────────────────────────────────────
+    def _open_export_dialog(self):
+        from ui.export_dialog import ExportDialog
+        dlg = ExportDialog(
+            has_daylight=self._daylight_result is not None,
+            has_thermal =self._thermal_result  is not None,
+            has_experiment=self._experiment_df is not None,
+            has_optimal=(
+                self._optimal_daylight_result is not None
+                and self._optimal_thermal_result is not None),
+            parent=self,
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        self._do_export(dlg)
+
+    def _do_export(self, dlg):
+        # 所有统一导出内容固定收纳到一个中文目录，避免散落在用户选择的
+        # 父目录中。文件自身仍带毫秒时间戳，连续导出不会互相覆盖。
+        d = os.path.join(dlg.export_dir, "建筑光热分析结果")
+        os.makedirs(d, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        raw_prefix = re.sub(
+            r'[<>:"/\\|?*]+',
+            "_",
+            str(dlg.export_prefix or "").strip(),
+        )
+        prefix = f"{raw_prefix or '分析结果'}_{timestamp}"
+        exported = []
+
+        try:
+            def safe_name(value: str) -> str:
+                cleaned = re.sub(r'[<>:"/\\|?*]+', "_", str(value)).strip()
+                return cleaned or "未命名房间"
+
+            display_model = (
+                self.building.get_space(self._active_space_id)
+                if self._active_space_id else None
+            )
+            if display_model is None:
+                raise ValueError("当前没有可导出的计算空间。")
+
+            audit = audit_building_geometry(self.building)
+            audit_path = os.path.join(d, f"{prefix}_模型与计算溯源.txt")
+            audit_lines = [
+                "RoomLight 模型与计算溯源",
+                f"软件版本：4.4.1",
+                f"导出时间：{datetime.now().isoformat(timespec='seconds')}",
+                f"工程文件：{self._current_file or '尚未保存'}",
+                f"气象数据：{self.weather.location or self.weather.source}",
+                audit.summary(),
+                "几何口径：墙/窗使用BP宿主轴线；面积、工作面和热工围护面积使用实体墙内表面净边界。",
+                "采光方法：CIE标准全阴天 + BRS室内互反射 + Littlefair室外反射 + 复杂空间射线遮挡。",
+                "热工方法：逐月单区集总热平衡；用于方案相对比较，论文定案需独立验证。",
+            ]
+            if audit.issues:
+                audit_lines.append("错误：" + "；".join(audit.issues))
+            if audit.warnings:
+                audit_lines.append("警告：" + "；".join(audit.warnings))
+            with open(audit_path, "w", encoding="utf-8-sig") as stream:
+                stream.write("\n".join(audit_lines) + "\n")
+            exported.append(audit_path)
+
+            # 普通分析按当前“选中房间”逐房间导出；单房间时保持历史文件名。
+            normal_entries = []
+            for space_id in self._selected_space_ids:
+                space = self.building.get_space(space_id)
+                daylight = self._daylight_results.get(space_id)
+                thermal = self._thermal_results.get(space_id)
+                if space is not None and (daylight is not None or thermal is not None):
+                    normal_entries.append((space, daylight, thermal))
+            if not normal_entries and (
+                self._daylight_result is not None or self._thermal_result is not None
+            ):
+                normal_entries.append(
+                    (display_model, self._daylight_result, self._thermal_result)
+                )
+
+            for space, daylight, thermal in normal_entries:
+                room_prefix = prefix
+                if len(normal_entries) > 1:
+                    room_prefix = f"{prefix}_{safe_name(space.name)}"
+                normal_ap = None
+                normal_tp = None
+                if daylight is not None:
+                    normal_ap = AnalysisPanel()
+                    normal_ap.update(
+                        daylight, space,
+                        weather_info=f"气象: {self.weather.location}")
+                if thermal is not None:
+                    normal_tp = ThermalPanel()
+                    normal_tp.update(thermal, space)
+
+                if dlg.chk_heatmap.isChecked() and daylight is not None:
+                    p = os.path.join(d, f"{room_prefix}_热力图.png")
+                    normal_ap.save_heatmap(p, dpi=200)
+                    exported.append(p)
+
+                if dlg.chk_profile.isChecked() and daylight is not None:
+                    p = os.path.join(d, f"{room_prefix}_截面分布.png")
+                    normal_ap.save_profile(p, dpi=200)
+                    exported.append(p)
+
+                if dlg.chk_thermal.isChecked() and thermal is not None:
+                    p = os.path.join(d, f"{room_prefix}_热环境.png")
+                    normal_tp.save_figure(p, dpi=200)
+                    exported.append(p)
+
+                if (
+                    dlg.chk_combined.isChecked()
+                    and daylight is not None
+                    and thermal is not None
+                ):
+                    p = os.path.join(d, f"{room_prefix}_光热综合.png")
+                    self._save_combined(
+                        p, analysis_panel=normal_ap, thermal_panel=normal_tp,
+                        title=f"{space.name}｜原始工程光热环境综合分析")
+                    exported.append(p)
+
+            # 多房间结果额外给出一张轻量 CSV 汇总表，便于横向筛选房间。
+            if len(normal_entries) > 1:
+                p = os.path.join(d, f"{prefix}_多房间分析汇总.csv")
+                fields = [
+                    "房间ID", "房间名称", "面积(m²)", "外窗数量",
+                    "平均采光系数DF(%)", "平均照度(lux)",
+                    "照度均匀度U0", "采光达标面积比Ra", "连续采光达标度Cd",
+                    "年均室温(℃)", "热不舒适度(℃·月)",
+                    "过热累积强度(℃·月)", "欠热累积强度(℃·月)",
+                ]
+                with open(p, "w", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    for space, daylight, thermal in normal_entries:
+                        writer.writerow({
+                            "房间ID": space.id,
+                            "房间名称": space.name,
+                            "面积(m²)": round(
+                                space_floor_area_mm2(space) / 1_000_000.0, 3),
+                            "外窗数量": sum(
+                                len(wall.windows())
+                                for wall in space.wall_segments()),
+                            "平均采光系数DF(%)": (
+                                round(float(daylight.DF_avg), 4)
+                                if daylight is not None else ""),
+                            "平均照度(lux)": (
+                                round(float(daylight.E_avg), 2)
+                                if daylight is not None else ""),
+                            "照度均匀度U0": (
+                                round(float(daylight.U0), 4)
+                                if daylight is not None else ""),
+                            "采光达标面积比Ra": (
+                                round(float(daylight.Ra), 4)
+                                if daylight is not None else ""),
+                            "连续采光达标度Cd": (
+                                round(float(daylight.daylight_score), 4)
+                                if daylight is not None else ""),
+                            "年均室温(℃)": (
+                                round(float(thermal.T_in_annual_avg), 3)
+                                if thermal is not None else ""),
+                            "热不舒适度(℃·月)": (
+                                round(thermal.thermal_discomfort, 4)
+                                if thermal is not None else ""),
+                            "过热累积强度(℃·月)": (
+                                round(thermal.overheat_degree_months, 4)
+                                if thermal is not None else ""),
+                            "欠热累积强度(℃·月)": (
+                                round(thermal.underheat_degree_months, 4)
+                                if thermal is not None else ""),
+                        })
+                exported.append(p)
+
+            if dlg.chk_exp_plots.isChecked() and self._experiment_df is not None:
+                exported.extend(self.experiment_panel.save_pngs(
+                    d, prefix=f"{prefix}_参数化实验"))
+
+            if dlg.chk_exp_csv.isChecked() and self._experiment_df is not None:
+                p = os.path.join(d, f"{prefix}_参数化实验结果.csv")
+                saved = self.experiment_panel.save_csv(p)
+                if saved:
+                    exported.append(saved)
+
+            if dlg.chk_optimal_plots.isChecked():
+                optimal_entries = []
+                for space_id in self._selected_space_ids:
+                    optimal_space = self._optimal_spaces.get(space_id)
+                    optimal_daylight = self._optimal_daylight_results.get(space_id)
+                    optimal_thermal = self._optimal_thermal_results.get(space_id)
+                    if (
+                        optimal_space is not None
+                        and optimal_daylight is not None
+                        and optimal_thermal is not None
+                    ):
+                        optimal_entries.append(
+                            (optimal_space, optimal_daylight, optimal_thermal)
+                        )
+                if not optimal_entries and (
+                    self._optimal_space is not None
+                    and self._optimal_daylight_result is not None
+                    and self._optimal_thermal_result is not None
+                ):
+                    optimal_entries.append((
+                        self._optimal_space,
+                        self._optimal_daylight_result,
+                        self._optimal_thermal_result,
+                    ))
+
+                for optimal_space, optimal_daylight, optimal_thermal in optimal_entries:
+                    optimal_ap = AnalysisPanel()
+                    optimal_tp = ThermalPanel()
+                    optimal_ap.update(
+                        optimal_daylight, optimal_space,
+                        weather_info=f"最优遮阳：{self._optimal_label}")
+                    optimal_tp.update(optimal_thermal, optimal_space)
+                    room_prefix = f"{prefix}_最优方案"
+                    if len(optimal_entries) > 1:
+                        room_prefix += f"_{safe_name(optimal_space.name)}"
+                    optimal_files = [
+                        (f"{room_prefix}_采光热力图.png",
+                         lambda path: optimal_ap.save_heatmap(path, dpi=200)),
+                        (f"{room_prefix}_照度截面.png",
+                         lambda path: optimal_ap.save_profile(path, dpi=200)),
+                        (f"{room_prefix}_热环境.png",
+                         lambda path: optimal_tp.save_figure(path, dpi=200)),
+                    ]
+                    for filename, writer in optimal_files:
+                        p = os.path.join(d, filename)
+                        writer(p)
+                        exported.append(p)
+                    p = os.path.join(d, f"{room_prefix}_光热综合.png")
+                    self._save_combined(
+                        p, analysis_panel=optimal_ap, thermal_panel=optimal_tp,
+                        title=(
+                            f"{optimal_space.name}｜最优遮阳方案光热综合分析"
+                            f"｜{self._optimal_label}"
+                        ))
+                    exported.append(p)
+
+            if dlg.chk_xls.isChecked():
+                p = os.path.join(d, f"{prefix}_报告.xlsx")
+                from io_utils.exporter import export_excel_v2
+                experiment_df = self.experiment_panel.flagged_dataframe()
+                export_excel_v2(p, self._daylight_result, self._thermal_result,
+                                display_model,
+                                self.weather if self.weather.is_valid() else None,
+                                experiment_df=experiment_df,
+                                experiment_params=getattr(self, "_exp_params", None),
+                                optimal_daylight_result=self._optimal_daylight_result,
+                                optimal_thermal_result=self._optimal_thermal_result,
+                                optimal_room=self._optimal_space,
+                                optimal_label=self._optimal_label)
+                exported.append(p)
+
+            self._status(f"已导出 {len(exported)} 个文件至 {d}")
+            QMessageBox.information(self, "导出完成",
+                f"成功导出 {len(exported)} 个文件:\n\n" +
+                "\n".join(os.path.basename(p) for p in exported))
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def _save_combined(self, path: str, analysis_panel=None,
+                       thermal_panel=None,
+                       title: str = "建筑室内光热环境综合分析"):
+        """光热综合拼合图"""
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.gridspec import GridSpec
+
+        fig = Figure(figsize=(16, 10), facecolor="#ffffff")
+        FigureCanvasAgg(fig)
+        gs  = GridSpec(2, 3,
+                        width_ratios=[1, 0.04, 1.2],
+                        height_ratios=[2.5, 1],
+                        figure=fig,
+                        left=0.06, right=0.97,
+                        top=0.92,  bottom=0.08,
+                        hspace=0.40, wspace=0.08)
+
+        ax_hm  = fig.add_subplot(gs[0, 0])
+        ax_cb  = fig.add_subplot(gs[0, 1])
+        ax_th  = fig.add_subplot(gs[0, 2])
+        ax_pf  = fig.add_subplot(gs[1, 0])
+        ax_hf  = fig.add_subplot(gs[1, 2])
+        fig.add_subplot(gs[1, 1]).set_visible(False)
+
+        analysis_panel = analysis_panel or self.analysis_panel
+        thermal_panel = thermal_panel or self.thermal_panel
+        analysis_panel._render_heatmap_ax(ax_hm, ax_cb, fig)
+        analysis_panel._render_profile_ax(ax_pf)
+        thermal_panel._render_line(ax_th)
+        thermal_panel._render_heatflow(ax_hf)
+
+        fig.suptitle(title, fontsize=14,
+                      fontweight="bold", color="#1a1e2e", y=0.97)
+        fig.savefig(path, dpi=200, facecolor="#ffffff",
+                     bbox_inches="tight", edgecolor="none")
+
+    def _status(self, msg: str):
+        self._status_lbl.setText(msg)
+
+
