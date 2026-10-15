@@ -18,7 +18,14 @@ env/
 build/
 dist/
 tmp/
+_tmp*/
+logs/
 *.log
+
+# Bundled third-party simulation runtimes and reproducible engine output
+engines/
+engine_results/
+engine_tests/
 
 # Secrets and local environment settings
 .env
@@ -31,6 +38,7 @@ tmp/
 experiment_out*/
 validate_out*/
 实验结果_*/
+验收_*/
 
 # Local building models and project data
 *.rlproj

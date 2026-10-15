@@ -1,0 +1,46 @@
+{
+  "date": "2026-10-14",
+  "software_version": "5.4.1",
+  "unit_and_regression_tests": {
+    "passed": 68,
+    "subtests_passed": 2,
+    "skipped": 2,
+    "skip_reason": "两个测试内真实引擎选测项未启用；另已对作者提供的实际案例独立运行三类小批量真实引擎验收",
+    "warnings": "测试直接绘图时未加载中文字体，出现259条字体警告；启动检查已调用中文字体设置",
+    "command": "python -m pytest -q tests/test_v541_energy_output.py tests/test_v540_common_contract.py tests/test_v530_staged_experiments.py tests/test_operation_weather.py tests/test_material_pricing.py tests/test_v443_cost_constrained_light_thermal.py tests/test_v442_operating_priority.py tests/test_v511_stability.py tests/test_v520_engines.py tests/test_bp_integration.py tests/test_v4_geometry_contract.py tests/test_v4_pareto.py tests/test_wall_plan_display.py --disable-warnings"
+  },
+  "compileall": "passed",
+  "offscreen_main_window_startup": "passed: v5.4.1",
+  "cli_help": "passed",
+  "wrong_project_area_guard": "passed: existing 51.932m2 project rejected before calculation, with no geometry replacement",
+  "manual_formula_example": {
+    "DF_percent": [0,2,4],
+    "area_weights": [1,2,1],
+    "E_out_lux": 15000,
+    "expected_DFavg_percent": 2,
+    "expected_Eavg_lux": 300,
+    "expected_Ra2": 0.75,
+    "expected_Cd2": 0.75,
+    "expected_U0": 0
+  },
+  "actual_original_case_acceptance": {
+    "A": "PASSED: actual converted 48.502m2 room2; three entry baselines identical at ab3/ad512, 250mm, 750mm workplane; PixelCounting 2048, Changsha CSWD EPW",
+    "B": "PASSED: actual baseline-scheme-baseline, source configurations unchanged",
+    "C": "PASSED: same schemes repeated in forward/reverse order; separate empty cache baseline agrees within rtol=atol=1e-10",
+    "D": "PASSED: independently derived weighted indicator and cost expectations",
+    "E": "PASSED at code level: components off, zero investment, finite metrics, invalid extremes, scan/final deltas; extreme real-engine runs NOT_RUN",
+    "F": "PASSED: one overhang, one fixed exterior louver and one exterior shelf computed with Radiance/EnergyPlus and exported; extra 0-degree louver free-run passed native pixel calculation. Full ranges and convergence NOT_RUN"
+  },
+  "full_rerun_started": false,
+  "independent_physical_validation": false,
+  "actual_acceptance_record": "../验收_20261014/建筑光热分析结果/20261014_004808_096018/小批量验收.json",
+  "saved_output_checks": "../验收_20261014/建筑光热分析结果/20261014_004808_096018/补充输出核对.json",
+  "scan_precision_verified": false,
+  "author_confirmed": ["二层，上下均房间；采用绝热近似", "程序内长沙CSWD EPW"],
+  "remaining_physical_inputs": [
+    "Actual second-storey elevation; no invented first-storey height was inserted",
+    "Existing EnergyPlus host/floor surface geometry uses wall axes while declared gains/air volume use net area; resulting area/volume warnings remain documented",
+    "Glazing/material optical and thermal properties, actual occupancy/controls, COP/tariff/service life remain unmeasured inputs",
+    "Ray and shadow resolution convergence and independent simulation/measurement validation not yet performed"
+  ]
+}

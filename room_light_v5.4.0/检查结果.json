@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-13",
+  "software_version": "5.4.0",
+  "unit_and_regression_tests": {
+    "passed": 60,
+    "subtests_passed": 2,
+    "skipped": 2,
+    "skip_reason": "真实引擎耗时测试需要显式启用；没有将旧归档fixture冒充48.502平方米原实验案例",
+    "warnings": "测试直接绘图时未加载中文字体，出现259条字体警告；启动检查已调用中文字体设置",
+    "command": "python -m pytest -q tests/test_v540_common_contract.py tests/test_v530_staged_experiments.py tests/test_operation_weather.py tests/test_material_pricing.py tests/test_v443_cost_constrained_light_thermal.py tests/test_v442_operating_priority.py tests/test_v511_stability.py tests/test_v520_engines.py tests/test_bp_integration.py tests/test_v4_geometry_contract.py tests/test_v4_pareto.py tests/test_wall_plan_display.py --disable-warnings"
+  },
+  "compileall": "passed",
+  "offscreen_main_window_startup": "passed: v5.4.0",
+  "cli_help": "passed",
+  "wrong_project_area_guard": "passed: existing 51.932m2 project rejected before calculation, with no geometry replacement",
+  "manual_formula_example": {
+    "DF_percent": [0,2,4],
+    "area_weights": [1,2,1],
+    "E_out_lux": 15000,
+    "expected_DFavg_percent": 2,
+    "expected_Eavg_lux": 300,
+    "expected_Ra2": 0.75,
+    "expected_Cd2": 0.75,
+    "expected_U0": 0
+  },
+  "actual_original_case_acceptance": {
+    "A": "NOT_RUN on current real engines: supplied old rlproj reproduces historical daylight after normal BP roundtrip, but actual upper/lower physical boundaries and EPW require confirmation",
+    "B": "NOT_RUN on exact original case; code-level clone/order checks passed",
+    "C": "NOT_RUN on exact original engines/cache; cache-key and order contracts tested",
+    "D": "PASSED: independently derived weighted indicator and cost expectations",
+    "E": "PASSED at code level: components off, zero investment, finite metrics, invalid extremes, scan/final deltas; extreme real-engine runs NOT_RUN",
+    "F": "Geometry/IDF generation, CSV and plot regression PASSED on explicitly identified archival test fixture; original-case real engine execution NOT_RUN"
+  },
+  "full_rerun_started": false,
+  "independent_physical_validation": false,
+  "required_files": [
+    "Author confirmation of actual roof/lower-floor thermal boundaries; supplied project defaults exposed/exposed whereas historical CSV is reproduced by adiabatic/adiabatic",
+    "Confirmation of Changsha CSWD EPW or another intended EPW for the current common-engine rerun; original monthly weather is present in supplied project",
+    "Selected room/window IDs and explicit physical/decision input confirmation"
+  ]
+}

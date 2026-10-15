@@ -1,0 +1,47 @@
+{
+  "space_ids": ["bp_space_2"],
+  "expected_net_area_m2": 48.502,
+  "engine": {
+    "epw_path": "",
+    "energyplus_path": "",
+    "ambient_bounces": 5,
+    "ambient_divisions": 4096,
+    "grid_mm": 250,
+    "workplane_height_mm": 750
+  },
+  "operation_profile": {
+    "building_type": "幼儿园",
+    "room_use": "普通班级活动室",
+    "teaching_days_per_year": 200,
+    "lighting_hours_per_day": 7.5,
+    "hvac_hours_per_day": 6,
+    "lighting_power_density_w_m2": 9,
+    "electricity_tariff_yuan_kwh": 0.85,
+    "cooling_cop": 3.2,
+    "heating_cop": 3.0,
+    "construction_service_life_years": 20,
+    "comfort_low_c": 18,
+    "comfort_high_c": 26,
+    "monthly_teaching_days": [15,15,22,21,21,20,0,0,21,22,21,22]
+  },
+  "thermal_objective": "thermal_discomfort",
+  "u0_min": 0,
+  "experiments": {
+    "tilt_degs": [60,70,80,90,100,110,120],
+    "depth_mms": [300,400,500,600,700,800,900,1000,1100,1200,1300,1400,1500],
+    "gap_mms": [0,100,200,300,400],
+    "materials_by_device": {
+      "horizontal_overhang": ["深色/多孔混凝土","密实混凝土","白色反射涂料混凝土","深色阳极氧化铝板","普通/氧化铝板","镜面高反射铝板","深色木材(胡桃木)","浅色木材(松木)","基层遮阳板+深色涂层","基层遮阳板+反射隔热白涂层"],
+      "louver": ["深色阳极氧化铝板","普通/氧化铝板","镜面高反射铝板","深色木材(胡桃木)","浅色木材(松木)"],
+      "light_shelf": ["深色阳极氧化铝板","普通/氧化铝板","镜面高反射铝板","深色木材(胡桃木)","浅色木材(松木)"]
+    },
+    "louver_params": {"angles":[0,10,20,30,40,50,60,70,80],"widths":[50,75,100,125,150],"spacings":[50,100,150,200,250,300,350],"positions":["exterior"],"controls":["fixed"]},
+    "light_shelf_params": {"inside_depths":[0],"outside_depths":[0,150,300,450,600,750,900],"tilts":[0,5,10,15,20,25,30],"upper_ratios":[0.1,0.2,0.3,0.4,0.5]}
+  },
+  "notes": {
+    "case": "必须指定与48.502平方米旧记录对应的实际完整rlproj；本文件不构造或替代几何",
+    "parameters": "这些运行值来自旧CSV，均待作者确认；净面积由模型读取，不硬编码",
+    "shelf": "本入口明确测外置板（内伸0）；旧CSV内伸100至500为内外组合，不能冒称外置板精算。界面的原范围仍保留。",
+    "weather": "请填入实际项目EPW，不默认指定以避免误用另一气象配置"
+  }
+}

@@ -3,7 +3,7 @@
 面向建筑学研究的室内采光、热环境与遮阳优化桌面工具。
 
 项目以 Python 和 PyQt6 构建，将建筑平面建模、采光计算、简化热工分析、参数化实验、
-帕累托筛选与论文图表导出整合到同一个桌面工作流中。当前最新版本为 **v4.4.3**。
+帕累托筛选与论文图表导出整合到同一个桌面工作流中。当前最新版本为 **v5.4.1**。
 
 > 本工具主要用于论文前期方案筛选、参数敏感性分析与结果可视化，不替代
 > Radiance、EnergyPlus 等逐时专业模拟，也不替代规范审查或实测验证。
@@ -33,7 +33,7 @@
 
 ```bash
 git clone https://github.com/wumo0327-find/room-light-analysis.git
-cd room-light-analysis/room_light_v4.4.3/room_light
+cd room-light-analysis/room_light_v5.4.1/room_light
 ```
 
 安装依赖并启动：
@@ -44,20 +44,22 @@ python main.py
 ```
 
 `main.py` 会通过相对路径读取界面资源，因此请在最新版的 `room_light` 目录中运行。
+Radiance 与 EnergyPlus 属于第三方计算引擎，未随 Git 仓库重复分发；需要论文精算功能时，
+请按 [`V5_2_计算引擎迁移说明.md`](room_light_v5.4.1/V5_2_计算引擎迁移说明.md) 配置本机引擎。
 
 ## 测试
 
-最新版测试代码位于 `room_light_v4.4.3/room_light/tests/`。在安装项目依赖后运行：
+最新版测试代码位于 `room_light_v5.4.1/room_light/tests/`。在安装项目依赖后运行：
 
 ```bash
-cd room_light_v4.4.3/room_light
+cd room_light_v5.4.1/room_light
 python -m unittest discover -s tests -v
 ```
 
 ## 代码结构
 
 ```text
-room_light_v4.4.3/room_light/
+room_light_v5.4.1/room_light/
 ├── main.py                 # 桌面应用入口
 ├── bp_editor/              # 建筑平面建模器
 ├── core/                   # 采光、热工、遮阳与优化计算
@@ -71,14 +73,14 @@ room_light_v4.4.3/room_light/
 ```
 
 仓库按语义化版本文件夹保存开发快照。若只想阅读或运行程序，请优先查看
-[`room_light_v4.4.3/room_light`](room_light_v4.4.3/room_light)。
+[`room_light_v5.4.1/room_light`](room_light_v5.4.1/room_light)。
 
 ## 文档
 
-- [最新版详细说明](room_light_v4.4.3/room_light/README.md)
-- [用户手册与版本日志](room_light_v4.4.3/room_light/MANUAL.md)
-- [计算理论](room_light_v4.4.3/room_light/THEORY.md)
-- [验证流程与适用边界](room_light_v4.4.3/room_light/VALIDATION_PROTOCOL.md)
+- [最新版详细说明](room_light_v5.4.1/room_light/README.md)
+- [用户手册与版本日志](room_light_v5.4.1/room_light/MANUAL.md)
+- [计算理论](room_light_v5.4.1/room_light/THEORY.md)
+- [验证流程与适用边界](room_light_v5.4.1/room_light/VALIDATION_PROTOCOL.md)
 
 ## 数据说明
 
@@ -87,11 +89,11 @@ room_light_v4.4.3/room_light/
 
 ## 当前研究边界
 
-- 采光核心采用 CIE 标准全阴天与简化反射模型，复杂项目应结合实测或专业软件复核。
-- 热工模块采用月代表工况的准稳态筛选模型，不等同于逐时动态能耗模拟。
+- 快速筛选模型用于方案探索；论文精算链调用官方 Radiance 与 EnergyPlus，并仍应结合实测复核。
+- 有限参数扫描只能说明研究参数域内的可行性，不能替代规范审查或完整工程设计。
 - 材料光热参数和工程价格用于方案比较，正式设计应替换为项目所在地的实测或询价数据。
 
 ## 版本
 
-当前版本：**v4.4.3**
-完整变更记录见最新版 [MANUAL.md](room_light_v4.4.3/room_light/MANUAL.md)。
+当前版本：**v5.4.1**
+完整变更记录见最新版 [MANUAL.md](room_light_v5.4.1/room_light/MANUAL.md)。
